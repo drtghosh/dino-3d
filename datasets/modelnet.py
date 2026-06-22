@@ -3,18 +3,16 @@ import os
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from sentence_transformers import SentenceTransformer
 
-from datasets.data_utils import farthest_point_sampling as fps
-from datasets.data_utils import random_sample
-from datasets.data_utils import positional_encoding
 from datasets.data_utils import read_point_cloud_off
+
+from torch_cluster import fps, knn
 
 
 def get_dataloader_modelnet40(split, config):
     is_shuffle = (split == 'train')
     if "dino" in config.module:
-        dataset = ModelNet40(split, config.data_root, config.n_pts)
+        dataset = ModelNet40DINO(split, config.data_root, config.n_pts, config.n_local, config.local_pts)
     else:
         raise ValueError("Unknown module: {}".format(config.module))
     dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=is_shuffle, num_workers=config.num_workers,
@@ -85,29 +83,38 @@ def split_data_without_labels(path, split):
     return split_paths, classes
 
 
-class ModelNet40(Dataset):
-    def __init__(self, split, data_root, n_pts):
-        super(ModelNet40, self).__init__()
+class ModelNet40DINO(Dataset):
+    def __init__(self, split, data_root, n_pts, n_local, local_pts):
+        super(ModelNet40DINO, self).__init__()
         self.split = split
         self.shuffle = (split == "train")
         self.data_root = data_root
-        self.paths, self.labels = split_data(data_root, split)
+        self.paths, self.classes = split_data(data_root, split)
         self.n_pts = n_pts
+        self.n_local = n_local
+        self.local_pts = local_pts
 
     def __getitem__(self, index):
         # read point cloud
         pc_path = os.path.join(self.data_root, self.paths[index])
         pc = read_point_cloud_off(pc_path)
-        # modify point cloud
+
+        # normalize point cloud
         assert len(pc.shape) == 2
         norm_pc = pc - np.mean(pc, axis=0)
         norm_pc /= np.max(np.linalg.norm(norm_pc, axis=1))
-        pc = fps(norm_pc, k=self.n_pts)
 
-        pc = torch.tensor(pc, dtype=torch.float32)
-        enc_pc = positional_encoding(pc).transpose(1, 0)
+        # create global view
+        tensor_pc = torch.tensor(norm_pc, dtype=torch.float32)
+        fps_idx_global = fps(tensor_pc, ratio=self.n_pts/len(norm_pc))
+        global_points = tensor_pc[fps_idx_global]
 
-        return {"id": self.paths[index], "encoded_points": enc_pc, "labels": self.labels[index]}
+        fps_idx_local = fps(global_points, ratio=self.n_local/self.n_pts)
+        row, col = knn(global_points, global_points[fps_idx_local], self.local_pts)
+        local_points = global_points[col]
+        local_points = local_points.view(self.n_local, -1, 3)
+
+        return {"id": self.paths[index], "global_view": global_points, "local_views": local_points}
 
     def __len__(self):
         return len(self.paths)

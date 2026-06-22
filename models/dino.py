@@ -227,16 +227,13 @@ class VisionTransformer(nn.Module):
         return x
 
 
-class DINOPoint(nn.Module):
-    def __init__(self, num_points, enc_dim=128, pos_enc_dim=48, num_subsample=512, num_locals=8, num_neighbors=64, space_dim=3):
-        super().__init__()
+class DINOPointEncoder(nn.Module):
+    def __init__(self, num_points, enc_dim=128, pos_enc_dim=48, num_subsample=1024, num_neighbors= 32, space_dim=3):
+        super(DINOPointEncoder, self).__init__()
 
         self.space_dim = space_dim
 
-        self.global_ratio = num_subsample / num_points
-        self.local_ratio = num_locals / num_points
-        self.num_locals = int(num_points / num_locals)
-        self.local_views = num_locals
+        self.ratio = num_subsample / num_points
         self.k = num_neighbors
 
         e = torch.pow(2, torch.arange(pos_enc_dim // 6)).float() * np.pi
@@ -270,42 +267,30 @@ class DINOPoint(nn.Module):
                                             )
 
     def forward(self, pc):
-        B, N, D = pc.shape # batch_size , num_points , space dimension
+        B, N, D = pc.shape # batch_size x num_points x space dimension
 
-        flattened_pc = pc.view(B * N, D) # flatten the points across batches (batch_size * num_points, space_dimension)
+        flattened_pc = pc.view(B * N, D)
 
-        batch = torch.arange(B).to(pc.device) 
-        batch = torch.repeat_interleave(batch, N) # for farthest point sampling across batches
+        batch = torch.arange(B).to(pc.device)
+        batch = torch.repeat_interleave(batch, N)
 
         points = flattened_pc
 
-        # global view
-        fps_idx_global = fps(points, batch, ratio=self.global_ratio) # sampling the centers for global view
+        fps_idx = fps(points, batch, ratio=self.ratio)
 
-        fps_idx_local = fps(points, batch, ratio=self.local_ratio) # sampling the centers for local views
+        row, col = knn(points, points[fps_idx], self.k, batch, batch[fps_idx])
+        edge_index = torch.stack([row, col], dim=0)
 
-        row, col = knn(points, points[fps_idx_global], self.k, batch, batch[fps_idx_global])
-        edge_index_global = torch.stack([row, col], dim=0)
+        x = self.point_conv(points, points[fps_idx], edge_index, self.basis)
+        points, batch = points[fps_idx], batch[fps_idx]
 
-        x_global = self.point_conv(points, points[fps_idx_global], edge_index_global, self.basis) # global view embeddings
-
-        # local views
-        row, col = knn(points, points[fps_idx_local], self.k, batch, batch[fps_idx_local])
-        local_points = points[col]
-        local_batch = torch.arange(B * self.local_views).to(pc.device)
-        local_batch = torch.repeat_interleave(local_batch, self.num_locals)
-        fps_idx_local_global = fps(local_points, local_batch, ratio=self.global_ratio)
-        row_local, col_local = knn(local_points, local_points[fps_idx_local_global], self.k, local_batch, local_batch[fps_idx_local_global])
-        edge_index_local = torch.stack([row_local, col_local], dim=0)
-        x_local = self.point_conv(local_points, local_points[fps_idx_local_global], edge_index_local, self.basis) # local views embeddings
-
-        x_global = x_global.view(B, -1, x_global.shape[-1])
+        x = x.view(B, -1, x.shape[-1])
         points = points.view(B, -1, D)
 
-        global_embeddings = embed(points, self.basis)
-        global_embeddings = self.point_encoder(torch.cat([points, global_embeddings], dim=2))
+        embeddings = embed(points, self.basis)
+        embeddings = self.point_encoder(torch.cat([points, embeddings], dim=2))
 
-        global_latents = self.transformer(x_global, global_embeddings)
+        out = self.transformer(x, embeddings)
 
-        
+        return out, points
         
