@@ -98,9 +98,14 @@ class TrainerDINO(object):
 		
 	@abstractmethod
 	def forward(self, data):
- 		"""
-            forward method for the student and teacher networks
 		"""
+			forward method for the student and teacher networks
+		"""
+		input_global = data["global_view"].to(self.device)
+		input_local = data["local_views"].to(self.device)
+		
+
+		
 
 	@abstractmethod
 	def collect_loss(self):
